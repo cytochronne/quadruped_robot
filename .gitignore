@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+env_*/
+venv/
+.env
+
+# Editors
+.vscode/
+.idea/
+.codex
+
+# Data / models / logs
+logs/
+*.ckpt
+*.pth
+*.pt
+unitree_model/
+/unitree_mujoco
+*.usd
+*.usda
+*.usdc
+*.sh
+id_ed25519_repo
+id_ed25519_repo.pub
+
+# System
+.DS_Store
+/IsaacLab
+*.sh
+!run.sh
+DevelopNot.md
