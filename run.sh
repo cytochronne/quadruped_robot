@@ -11,8 +11,10 @@
 # 激活你对应的 conda 环境（如果需要）
 #conda activate SEAMP
 
+
 export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v anaconda3 | paste -sd:)
 
+cd unitree_rl_lab
 
 echo "enter unitree_rl_lab directory"
 
@@ -66,10 +68,10 @@ echo "enter unitree_rl_lab directory"
 
 
 #baseline 训练命令
-python scripts/rsl_rl/train_baselinewoU.py --headless --task Unitree-Go2-Velocity-lab-Rough-Env-v0 --num_envs 4096  --log_root /home/rashare/yanzhexie/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rsl_rl/student_baseline \
+python scripts/rsl_rl/train_baseline.py --headless --task Unitree-Go2-Velocity-lab-Rough-Env-v0 --num_envs 4096  --log_root /home/rashare/yanzhexie/quadruped_robot/unitree_rl_lab/logs/student_baseline \
                                     --resume_path /home/rashare/yanzhexie/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rsl_rl/teacher/rsl_rl/unitree_go2_velocity/2026-04-02_20-31-56_TeacherNewTerrain4/model_6200.pt \
-                                    --run_name baseline_rl\
-                                    --device cuda:5 \
+                                    --run_name baseline_bc_initnoise0.1\
+                                    --device cuda:6 \
                                     
                                    
 

@@ -455,59 +455,30 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
+        # observation terms (order preserved)
+
         base_ang_vel = ObsTerm(
             func=mdp.base_ang_vel,
             scale=0.2,
             clip=(-100, 100),
-            noise=BurstNoiseModelCfg(
-                interval_steps_range=SHARED_INTERVAL_STEPS_RANGE,
-                burst_steps_range=SHARED_BURST_STEPS_RANGE,
-                shared_id="joint_burst",
-                burst_std=1.26,
-                base_noise=Gnoise(mean=0.0, std=0.2),
-                burst_clip=(-100.0, 100.0),
-            ),
+            noise=Gnoise(mean=0.0, std=0.2),
         )
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
             clip=(-100, 100),
-            noise=BurstNoiseModelCfg(
-                interval_steps_range=SHARED_INTERVAL_STEPS_RANGE,
-                burst_steps_range=SHARED_BURST_STEPS_RANGE,
-                shared_id="joint_burst",
-                burst_std=1.58,
-                base_noise=Unoise(n_min=-0.05, n_max=0.05),
-                burst_clip=(-100.0, 100.0),
-            ),
+            noise=Unoise(n_min=-0.05, n_max=0.05),
         )
-
         joint_pos_rel = ObsTerm(
             func=mdp.joint_pos_rel,
             clip=(-100, 100),
-            noise=BurstNoiseModelCfg(
-                interval_steps_range=SHARED_INTERVAL_STEPS_RANGE,
-                burst_steps_range=SHARED_BURST_STEPS_RANGE,
-                shared_id="joint_burst",
-                burst_std=0.95,
-                base_noise=Unoise(n_min=-0.01, n_max=0.01),
-                burst_clip=(-100.0, 100.0),
-            ),
+            noise=Unoise(n_min=-0.01, n_max=0.01),
         )
-
         joint_vel_rel = ObsTerm(
             func=mdp.joint_vel_rel,
             scale=0.05,
             clip=(-100, 100),
-            noise=BurstNoiseModelCfg(
-                interval_steps_range=SHARED_INTERVAL_STEPS_RANGE,
-                burst_steps_range=SHARED_BURST_STEPS_RANGE,
-                shared_id="joint_burst",
-                burst_std=0.79,
-                base_noise=Gnoise(mean=0.0, std=1.5),
-                burst_clip=(-100.0, 100.0),
-            ),
+            noise=Gnoise(mean=0.0, std=1.5),
         )
-
         joint_effort = ObsTerm(
             func=mdp.joint_effort,
             scale=0.01,

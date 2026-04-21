@@ -112,12 +112,12 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     desired_kl=0.01
     
     #RL settings
-    RL_loss_coef=1.0
-    entropy_coef=0.01
+    RL_loss_coef=0.0
+    entropy_coef=0.0
     
     #setting4BC
-    bc_loss_coef=0.0
-    use_mse_loss = False
+    bc_loss_coef=1.0
+    use_mse_loss = True
 
     #deepmimic style imitation loss
     use_action_imitation_reward = False
@@ -129,7 +129,7 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
 @configclass
 class TerrainAwareDistillationRunnerCfg(BasePPORunnerCfg):
     policy = TerrainAwareStudentTeacherCfg(
-        init_noise_std=1.0,
+        init_noise_std=0.1,
         teacher_height_obs_dim=88,
         student_height_obs_dim=0,
         activation="elu",
