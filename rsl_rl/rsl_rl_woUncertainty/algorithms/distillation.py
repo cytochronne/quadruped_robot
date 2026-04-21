@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # torch
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +50,15 @@ class Distillation:
         uncertainty_warmup_iters: int = 500,
         uncertainty_ema_beta: float = 0.01,
         uncertainty_eps: float = 1e-6,
+        curriculum_enable: bool = False,
+        curriculum_start_iter: int = 1000,
+        curriculum_ramp_iters: int = 1500,
+        curriculum_final_rl_coef: float = 1.0,
+        curriculum_final_bc_coef: float = 0.0,
+        curriculum_noise_start: float | None = None,
+        curriculum_noise_target: float = 0.8,
+        curriculum_noise_handover_to_rl: bool = True,
+        curriculum_type: str = "linear",
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         **kwargs,
@@ -166,6 +176,31 @@ class Distillation:
         self.action_imitation_reward_coef = action_imitation_reward_coef
         self.use_mse_loss = use_mse_loss
 
+        # BC -> RL curriculum parameters
+        self.curriculum_enable = curriculum_enable
+        self.curriculum_start_iter = max(0, int(curriculum_start_iter))
+        self.curriculum_ramp_iters = max(1, int(curriculum_ramp_iters))
+        self.curriculum_final_rl_coef = float(curriculum_final_rl_coef)
+        self.curriculum_final_bc_coef = float(curriculum_final_bc_coef)
+        self.curriculum_noise_target = float(curriculum_noise_target)
+        self.curriculum_noise_handover_to_rl = bool(curriculum_noise_handover_to_rl)
+        self.curriculum_type = curriculum_type
+
+        if self.curriculum_type != "linear":
+            raise ValueError(f"Unsupported curriculum_type: {self.curriculum_type}")
+
+        # Runtime coefficients used in loss computation
+        self.active_rl_loss_coef = float(self.RL_loss_coef)
+        self.active_bc_loss_coef = float(self.bc_loss_coef)
+        self.curriculum_progress = 0.0
+
+        if curriculum_noise_start is None:
+            self.curriculum_noise_start = self._get_current_noise_std()
+        else:
+            self.curriculum_noise_start = float(curriculum_noise_start)
+        self.curriculum_target_noise_std = self.curriculum_noise_start
+        self.curriculum_noise_handover_done = False
+
         # Uncertainty reward parameters
         self.uncertainty_abs_coef = uncertainty_abs_coef
         self.uncertainty_delta_coef = uncertainty_delta_coef
@@ -269,8 +304,92 @@ class Distillation:
         self.transition.clear()
         self.policy.reset(dones)
 
+    def _compute_curriculum_progress(self, update_idx: int) -> float:
+        if (not self.curriculum_enable) or update_idx < self.curriculum_start_iter:
+            return 0.0
+        if self.curriculum_ramp_iters <= 0:
+            return 1.0
+        progress = (update_idx - self.curriculum_start_iter) / self.curriculum_ramp_iters
+        return float(max(0.0, min(1.0, progress)))
+
+    def _mix_with_progress(self, start_value: float, end_value: float, progress: float) -> float:
+        return float(start_value + (end_value - start_value) * progress)
+
+    def _get_current_noise_std(self) -> float:
+        if hasattr(self.policy, "log_std"):
+            return float(torch.exp(self.policy.log_std.detach()).mean().item())
+
+        if hasattr(self.policy, "std"):
+            std_param = self.policy.std.detach()
+            if getattr(self.policy, "noise_std_type", None) == "scalar":
+                std_value = F.softplus(std_param) + 1.0e-6
+                return float(std_value.mean().item())
+            return float(std_param.mean().item())
+
+        return 0.0
+
+    def _set_policy_noise_std(self, target_std: float) -> None:
+        target_std = max(float(target_std), 1.0e-6)
+
+        if hasattr(self.policy, "log_std"):
+            self.policy.log_std.data.fill_(math.log(target_std))
+            return
+
+        if hasattr(self.policy, "std"):
+            if getattr(self.policy, "noise_std_type", None) == "scalar":
+                # Inverse of softplus to keep effective std close to target.
+                y = torch.tensor(target_std - 1.0e-6, device=self.policy.std.device, dtype=self.policy.std.dtype)
+                y = torch.clamp(y, min=1.0e-8)
+                raw_target = torch.log(torch.expm1(y))
+                self.policy.std.data.fill_(raw_target.item())
+            else:
+                self.policy.std.data.fill_(target_std)
+
+    def _update_curriculum_state(self) -> None:
+        if not self.curriculum_enable:
+            self.curriculum_progress = 0.0
+            self.active_rl_loss_coef = float(self.RL_loss_coef)
+            self.active_bc_loss_coef = float(self.bc_loss_coef)
+            self.curriculum_target_noise_std = self._get_current_noise_std()
+            self.curriculum_noise_handover_done = False
+            return
+
+        self.curriculum_progress = self._compute_curriculum_progress(self.num_updates)
+        self.active_rl_loss_coef = self._mix_with_progress(
+            self.RL_loss_coef, self.curriculum_final_rl_coef, self.curriculum_progress
+        )
+        self.active_bc_loss_coef = self._mix_with_progress(
+            self.bc_loss_coef, self.curriculum_final_bc_coef, self.curriculum_progress
+        )
+
+        if self.curriculum_progress < 1.0:
+            self.curriculum_target_noise_std = self._mix_with_progress(
+                self.curriculum_noise_start, self.curriculum_noise_target, self.curriculum_progress
+            )
+            self._set_policy_noise_std(self.curriculum_target_noise_std)
+            self.curriculum_noise_handover_done = False
+            return
+
+        # At full RL phase, either keep forcing final noise target or hand over to RL optimization.
+        if not self.curriculum_noise_handover_to_rl:
+            self.curriculum_target_noise_std = self.curriculum_noise_target
+            self._set_policy_noise_std(self.curriculum_target_noise_std)
+            self.curriculum_noise_handover_done = False
+            return
+
+        if not self.curriculum_noise_handover_done:
+            # One-time alignment before handing over noise control to RL updates.
+            self.curriculum_target_noise_std = self.curriculum_noise_target
+            self._set_policy_noise_std(self.curriculum_target_noise_std)
+            self.curriculum_noise_handover_done = True
+            return
+
+        self.curriculum_target_noise_std = self._get_current_noise_std()
+
     def update(self):
         self.num_updates += 1
+        self._update_curriculum_state()
+
         mean_mse_loss = 0.0
         mean_bc_loss = 0.0
         mean_surrogate_loss = 0.0
@@ -307,7 +426,7 @@ class Distillation:
                 mse_loss = F.mse_loss(student_latent, teacher_latent)
 
                 # 3. Detach Latent for Policy Head (Stop gradient from RL/BC to Encoder)
-                if self.RL_loss_coef != 0.0:
+                if self.active_rl_loss_coef != 0.0:
                     student_latent_detached = student_latent
                 else:
                     student_latent_detached = student_latent.detach()
@@ -382,10 +501,10 @@ class Distillation:
                 # Total Loss
                 # mse_loss affects encoder
                 # surrogate_loss (+ optional bc_loss) affects policy head (due to detach)
-                loss = self.RL_loss_coef * surrogate_loss - self.entropy_coef * entropy_batch.mean()
+                loss = self.active_rl_loss_coef * surrogate_loss - self.entropy_coef * entropy_batch.mean()
                 
                 if not self.use_action_imitation_reward:
-                    loss += self.bc_loss_coef * bc_loss
+                    loss += self.active_bc_loss_coef * bc_loss
                 
                 if self.use_mse_loss:
                     loss += mse_loss
@@ -462,12 +581,16 @@ class Distillation:
         # construct the loss dictionary
         loss_dict = {
             "mse_loss": mean_mse_loss,
-            "bc_loss": mean_bc_loss * self.bc_loss_coef if not self.use_action_imitation_reward else 0.0,
-            "surrogate_loss": mean_surrogate_loss * self.RL_loss_coef,
+            "bc_loss": mean_bc_loss * self.active_bc_loss_coef if not self.use_action_imitation_reward else 0.0,
+            "surrogate_loss": mean_surrogate_loss * self.active_rl_loss_coef,
             "value_function": mean_value_loss,
             "latent/student_mean_norm": mean_student_mean_norm,
             "latent/teacher_mean_norm": mean_teacher_mean_norm,
             "distillation/mean_action_imitation_reward": mean_imitation_reward,
+            "distillation/curriculum_progress": self.curriculum_progress,
+            "distillation/active_bc_coef": self.active_bc_loss_coef,
+            "distillation/active_rl_coef": self.active_rl_loss_coef,
+            "distillation/target_noise_std": self.curriculum_target_noise_std,
         }
 
         return loss_dict

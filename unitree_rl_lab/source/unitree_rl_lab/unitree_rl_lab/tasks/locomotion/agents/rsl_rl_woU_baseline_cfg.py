@@ -119,6 +119,17 @@ class TerrainAwareDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
     bc_loss_coef=1.0
     use_mse_loss = True
 
+    # BC -> RL curriculum
+    curriculum_enable = True
+    curriculum_start_iter = 1000
+    curriculum_ramp_iters = 500
+    curriculum_final_rl_coef = 1.0
+    curriculum_final_bc_coef = 0.0
+    curriculum_noise_start = 0.744
+    curriculum_noise_target = 0.744
+    curriculum_noise_handover_to_rl = True
+    curriculum_type = "linear"
+
     #deepmimic style imitation loss
     use_action_imitation_reward = False
     action_imitation_reward_coef = 1.0

@@ -5,7 +5,7 @@
 
 import math
 from dataclasses import MISSING
-
+from isaaclab.utils.noise import NoiseModel, NoiseModelCfg
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
 import numpy as np
@@ -31,12 +31,167 @@ from isaaclab.utils.noise import AdditiveGaussianNoiseCfg as Gnoise
 from unitree_rl_lab.tasks.locomotion import mdp
 from math import pi
 
+from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 from unitree_rl_lab.assets.robots.unitree import UNITREE_GO2_CFG_lab
 
 ##
 # Pre-defined configs
 ##
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
+
+
+class BurstNoiseModel(NoiseModel):
+    """Stateful per-env burst noise with random intervals."""
+
+    # Provide a __name__ so callable_to_string can serialize instances
+    __name__ = "BurstNoiseModel"
+    
+    # 类级别的共享状态字典
+    _shared_states = {}
+
+    def __init__(self, cfg, num_envs: int, device: str | torch.device):
+        # ObservationManager passes (cfg, num_envs, device)
+        super().__init__(cfg, num_envs, device)
+        # Keep a public alias for convenience since the base stores it as _noise_model_cfg
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self.burst_bias = None
+        print(f"Initializing BurstNoiseModel on device {self.device} for {num_envs} envs.")
+        
+        # 检查是否使用共享状态
+        shared_id = getattr(cfg, "shared_id", None)
+        
+        if shared_id is not None:
+            # 使用共享状态
+            if shared_id not in self._shared_states:
+                # 首次创建，初始化共享状态
+                self._shared_states[shared_id] = {
+                    "steps_until_burst": self._sample_range(self.cfg.interval_steps_range, num_envs, self.device),
+                    "burst_steps_left": torch.zeros(num_envs, device=self.device, dtype=torch.long),
+                }
+            # 引用共享状态
+            self.steps_until_burst = self._shared_states[shared_id]["steps_until_burst"]
+            self.burst_steps_left = self._shared_states[shared_id]["burst_steps_left"]
+            self.shared_id = shared_id
+        else:
+            # 独立状态
+            self.steps_until_burst = self._sample_range(self.cfg.interval_steps_range, num_envs, self.device)
+            self.burst_steps_left = torch.zeros(num_envs, device=self.device, dtype=torch.long)
+            self.shared_id = None
+
+    def __call__(self, data: torch.Tensor) -> torch.Tensor:
+        if self.steps_until_burst is None or self.burst_steps_left is None:
+            return data
+        if self.burst_bias is None or self.burst_bias.shape != data.shape:
+            self.burst_bias = torch.zeros_like(data)
+        
+
+        # if torch.rand(1).item() < 0.1:  # 1% 概率打印，避免刷屏
+        #     print(f"[BurstDebug] shared_id={self.shared_id}")
+        #     print(f"  steps_until_burst: min={self.steps_until_burst.min().item()}, max={self.steps_until_burst.max().item()}, mean={self.steps_until_burst.float().mean().item():.1f}")
+        #     print(f"  burst_steps_left: min={self.burst_steps_left.min().item()}, max={self.burst_steps_left.max().item()}, sum={self.burst_steps_left.sum().item()}")
+        
+        
+        data_noisy = self._apply_base_noise(data)
+
+        bursting = self.burst_steps_left > 0
+
+        if getattr(self.cfg, "normalize", False):
+            norms = torch.linalg.norm(data_noisy, dim=-1, keepdim=True)
+            data_noisy = data_noisy / torch.clamp(norms, min=1e-8)
+            
+
+        new_burst_steps = torch.where(bursting, self.burst_steps_left - 1, self.burst_steps_left)
+        burst_end_mask = bursting & (new_burst_steps == 0)
+        self.burst_steps_left = new_burst_steps
+
+        self.steps_until_burst = torch.where(bursting, self.steps_until_burst, self.steps_until_burst - 1)
+
+        start_mask = (~bursting) & (self.steps_until_burst <= 0)
+        if start_mask.any():
+            count = int(start_mask.sum().item())
+            self.burst_steps_left[start_mask] = self._sample_range(self.cfg.burst_steps_range, count, self.device)
+            self.steps_until_burst[start_mask] = 0
+            new_bias = torch.randn_like(data_noisy[start_mask]) * float(self.cfg.burst_std)
+            self.burst_bias[start_mask] = new_bias
+
+        if bursting.any():
+            data_noisy[bursting] = data_noisy[bursting] + self.burst_bias[bursting]
+            print("INFO:bursting")
+        else:
+            print("INFO: not bursting")
+
+        if burst_end_mask.any():
+            count = int(burst_end_mask.sum().item())
+            self.steps_until_burst[burst_end_mask] = self._sample_range(self.cfg.interval_steps_range, count, self.device)
+            self.burst_bias[burst_end_mask] = 0.0
+
+        if self.cfg.burst_clip is not None:
+            low, high = self.cfg.burst_clip
+            data_noisy = torch.clamp(data_noisy, min=low, max=high)
+
+        return data_noisy
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+            count = self.burst_steps_left.shape[0]
+        else:
+            if isinstance(env_ids, slice):
+                # slice(None) handled above; for partial slice, materialize indices
+                env_ids = torch.arange(self.burst_steps_left.shape[0], device=self.device)[env_ids]
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            count = env_ids.numel()
+        if count == 0:
+            return
+        self.steps_until_burst[env_ids] = self._sample_range(self.cfg.interval_steps_range, count, self.device)
+        self.burst_steps_left[env_ids] = 0
+        if self.burst_bias is not None:
+            self.burst_bias[env_ids] = 0.0
+
+    def _apply_base_noise(self, data: torch.Tensor) -> torch.Tensor:
+        cfg = getattr(self.cfg, "base_noise", None)
+        if cfg is None:
+            return data
+
+        if hasattr(cfg, "n_min") and hasattr(cfg, "n_max"):
+            noise = torch.rand_like(data) * (float(cfg.n_max) - float(cfg.n_min)) + float(cfg.n_min)
+            return data + noise
+
+        if hasattr(cfg, "std"):
+            mean = float(getattr(cfg, "mean", 0.0))
+            std = float(cfg.std)
+            return data + torch.randn_like(data) * std + mean
+
+        return data
+
+    @staticmethod
+    def _sample_range(bounds: Tuple[int, int], count: int, device: torch.device) -> torch.Tensor:
+        low, high = bounds
+        if high < low:
+            high = low
+        return torch.randint(low, high + 1, (count,), device=device, dtype=torch.long)
+
+
+@configclass
+class BurstNoiseModelCfg(NoiseModelCfg):
+    #step
+    interval_steps_range: Tuple[int, int] = (30, 60)
+    burst_steps_range: Tuple[int, int] = (10, 25)
+    burst_std: float = 1.0
+    base_noise: Optional[object] = None
+    burst_clip: Optional[Tuple[float, float]] = None
+    noise_cfg: object = Gnoise(mean=0.0, std=0.0)
+    shared_id: Optional[str] = None  # 用于标识共享组
+    normalize: bool = False
+
+    def __post_init__(self):
+        try:
+            super().__post_init__()
+        except AttributeError:
+            pass
+        self.class_type = BurstNoiseModel
+
 
 
 ##
@@ -143,14 +298,14 @@ def stitched_modular(difficulty, cfg):
     #     ["rough", "stairs", "slope", "rough"],
     # ]
 
-    layouts = [
-        ["stepping_stones", "rough", "stairs", "slope"],
-        ["slope", "stairs", "rough", "stepping_stones"],
-        ["slope", "stairs", "rough", "stepping_stones"],
-        ["rough", "stairs", "rough", "stepping_stones"],
-    ]
+    # layouts = [
+    #     ["stepping_stones", "rough", "stairs", "slope"],
+    #     ["slope", "stairs", "rough", "stepping_stones"],
+    #     ["slope", "stairs", "rough", "stepping_stones"],
+    #     ["rough", "stairs", "rough", "stepping_stones"],
+    # ]
 
-    #layouts = [["flat", "flat", "flat", "flat"]]
+    layouts = [["stairs", "stairs", "stairs", "stairs"]]
 
     if layouts:
         layout = layouts[np.random.randint(len(layouts))]
@@ -275,7 +430,7 @@ class CommandsCfg:
         heading_control_stiffness=0.5,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-0.5, 0.5), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
         ),
     )
 
@@ -286,6 +441,9 @@ class ActionsCfg:
 
     joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.5, use_default_offset=True)
 
+
+SHARED_INTERVAL_STEPS_RANGE = (180, 250)
+SHARED_BURST_STEPS_RANGE = (50, 100)
 
 @configclass
 class ObservationsCfg:
@@ -337,7 +495,6 @@ class ObservationsCfg:
             self.enable_corruption = True
             self.concatenate_terms = True
             self.flatten_history_dim = True
-    
     
     # observation groups
     policy: PolicyCfg = PolicyCfg()
@@ -415,6 +572,8 @@ class EventCfg:
         },
     )
 
+    
+
     # reset
     base_external_force_torque = EventTerm(
         func=mdp.apply_external_force_torque,
@@ -462,105 +621,41 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP_23."""
+    """Reward terms for the MDP."""
 
     # -- task
-    track_lin_vel_xy = RewTerm(
-        func=mdp.track_lin_vel_xy_exp, weight=2.0, params={"command_name": "base_velocity", "std": math.sqrt(0.5)}
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
-    track_ang_vel_z = RewTerm(
-        func=mdp.track_ang_vel_z_exp, weight=1.5, params={"command_name": "base_velocity", "std": math.sqrt(0.5)}
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     )
-    # vel_tracking_success = RewTerm(
-    #     func=mdp.vel_tracking_success, weight=1.0, params={"command_name": "base_velocity", "lin_thresh": 0.1}
-    # )
-
-    # -- base
-    #base_linear_velocity = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
-    base_angular_velocity = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    #joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.001)
-    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
-    joint_torques = RewTerm(func=mdp.joint_torques_l2, weight=-5e-5)
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.05)
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-10.0)
-    energy = RewTerm(func=mdp.energy, weight=-2e-6)
-    # standstill_penalty = RewTerm(
-    #     func=mdp.standstill_penalty,
-    #     weight=-1.5,
-    #     params={"command_name": "base_velocity", "vel_threshold": 0.15, "cmd_threshold": 0.2},
-    # )
-
-    # -- robot
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.5)
-    
-    joint_pos = RewTerm(
-        func=mdp.joint_position_penalty,
-        weight=-0.005,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "stand_still_scale": 1.0,
-            "velocity_threshold": 0.3,
-        },
-    )
-
-    # -- feet
+    # -- penalties
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
-        weight=0.01,
+        weight=0.125,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
             "threshold": 0.5,
         },
     )
-    air_time_variance = RewTerm(
-        func=mdp.air_time_variance_penalty,
-        weight=-0.5,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot")},
-    )
-    feet_slide = RewTerm(
-        func=mdp.feet_slide,
-        weight=-0.1,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-        },
-    )
-    # feet_contact_forces = RewTerm(
-    #     func=mdp.contact_forces,
-    #     weight=-0.02,
-    #     params={
-    #         "threshold": 100.0,
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-    #     },
-    # )
-
-    # -- other
-    undesired_contacts = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-1.25,
-        params={
-            "threshold": 1,
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["Head_.*", ".*_hip", ".*_thigh", ".*_calf"]),
-        },
-    )
-
     base_link_contact = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-1.5,
+        weight=-0.5,
         params={
             "threshold": 1,
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"),
         },
     )
-
-    # Penalize failure terminations (e.g. bad orientation). Excludes time-outs when available.
-    termination_penalty = RewTerm(
-        func=mdp.termination_failure_flag,
-        weight=-25.0,
-        params={"include_time_outs": False},
-    )
-
+    # -- optional penalties
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
 
 
 @configclass
@@ -568,11 +663,13 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    # check if robot is out of map
     map_edge_time_out = DoneTerm(
         func=mdp.position_out_of_terrain_bounds,
         time_out=True,
         params={"edge_margin": 0.05},
     )
+    # check if robot is out of map
     void_fall_time_out = DoneTerm(
         func=mdp.root_height_below_minimum,
         time_out=True,
@@ -617,7 +714,7 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # general settings
         self.decimation = 4
-        self.episode_length_s = 20.0
+        self.episode_length_s = 30.0
         # simulation settings
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
@@ -675,16 +772,16 @@ class UnitreeGo2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.base_com = None
 
         # rewards
-        # self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"
-        # self.rewards.feet_air_time.weight = 0.01
-        # self.rewards.undesired_contacts = None
-        # self.rewards.dof_torques_l2.weight = -0.0002
-        # self.rewards.track_lin_vel_xy_exp.weight = 1.5
-        # self.rewards.track_ang_vel_z_exp.weight = 0.75
-        # self.rewards.dof_acc_l2.weight = -2.5e-7
+        self.rewards.feet_air_time.params["sensor_cfg"].body_names = ".*_foot"
+        self.rewards.feet_air_time.weight = 0.01
+        #self.rewards.undesired_contacts = None
+        self.rewards.dof_torques_l2.weight = -0.0002
+        self.rewards.track_lin_vel_xy_exp.weight = 1.5
+        self.rewards.track_ang_vel_z_exp.weight = 0.75
+        self.rewards.dof_acc_l2.weight = -2.5e-7
 
-        # terminations
-        #self.terminations.base_contact.params["sensor_cfg"].body_names = "base"
+        # #terminations
+        # self.terminations.base_contact.params["sensor_cfg"].body_names = "base"
 
 
 @configclass
@@ -694,22 +791,21 @@ class UnitreeGo2RoughEnvCfg_PLAY(UnitreeGo2RoughEnvCfg):
         super().__post_init__()
 
         # make a smaller scene for play
-        self.scene.num_envs = 32
+        self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         # spawn the robot randomly in the grid (instead of their terrain levels)
         self.scene.terrain.max_init_terrain_level = None
         # reduce the number of terrains to save memory
         if self.scene.terrain.terrain_generator is not None:
             self.scene.terrain.terrain_generator.num_rows = 10
-            self.scene.terrain.terrain_generator.num_cols = 5
+            self.scene.terrain.terrain_generator.num_cols = 10
+            #self.scene.terrain.terrain_generator.curriculum = False
             self.curriculum.terrain_levels = None
-        self.commands.base_velocity.rel_standing_envs =0.2
-
-
-        self.scene.terrain.max_init_terrain_level = 6
+            level = 6
+            self.scene.terrain.max_init_terrain_level = level
 
         # disable randomization for play
-        self.observations.policy.enable_corruption = False
+        #self.observations.policy.enable_corruption = False
         # remove random pushing event
-        self.events.base_external_force_torque = None
-        self.events.push_robot = None
+        #self.events.base_external_force_torque = None
+        #self.events.push_robot = None
