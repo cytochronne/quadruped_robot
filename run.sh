@@ -12,8 +12,7 @@
 #conda activate SEAMP
 
 
-export WANDB_API_KEY="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"
-export WANDB_ENTITY="yxie667-hkust"
+
 
 export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v anaconda3 | paste -sd:)
 
