@@ -36,7 +36,7 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, choices=tasks, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
@@ -53,6 +53,77 @@ parser.add_argument(
         "Fraction of environments that follow waypoint targets when "
         "--track_waypoints is enabled (0.0-1.0). The rest use random commands."
     ),
+)
+parser.add_argument(
+    "--rl_algorithm",
+    type=str,
+    default="auto",
+    choices=["auto", "td3", "sac"],
+    help=(
+        "RL algorithm selector. "
+        "'auto' keeps existing RSL-RL behavior, "
+        "'td3' and 'sac' run local off-policy implementations in rsl_rl_woUncertainty."
+    ),
+)
+parser.add_argument(
+    "--offpolicy_total_timesteps",
+    type=int,
+    default=1_000_000,
+    help="Total environment timesteps for TD3/SAC training.",
+)
+parser.add_argument(
+    "--offpolicy_learning_rate",
+    type=float,
+    default=3.0e-4,
+    help="Learning rate for TD3/SAC.",
+)
+parser.add_argument(
+    "--offpolicy_buffer_size",
+    type=int,
+    default=1_000_000,
+    help="Replay buffer size for TD3/SAC.",
+)
+parser.add_argument(
+    "--offpolicy_learning_starts",
+    type=int,
+    default=10000,
+    help="Number of warmup steps before TD3/SAC updates start.",
+)
+parser.add_argument(
+    "--offpolicy_batch_size",
+    type=int,
+    default=256,
+    help="Batch size for TD3/SAC updates.",
+)
+parser.add_argument(
+    "--offpolicy_train_freq",
+    type=int,
+    default=1,
+    help="Training frequency (steps) for TD3/SAC.",
+)
+parser.add_argument(
+    "--offpolicy_gradient_steps",
+    type=int,
+    default=1,
+    help="Gradient steps per update for TD3/SAC.",
+)
+parser.add_argument(
+    "--offpolicy_tau",
+    type=float,
+    default=0.005,
+    help="Polyak averaging coefficient for TD3/SAC target networks.",
+)
+parser.add_argument(
+    "--offpolicy_gamma",
+    type=float,
+    default=0.99,
+    help="Discount factor for TD3/SAC.",
+)
+parser.add_argument(
+    "--offpolicy_log_interval",
+    type=int,
+    default=10,
+    help="Logging interval used by local TD3/SAC learn().",
 )
 
 
@@ -117,6 +188,7 @@ if args_cli.distributed and version.parse(installed_version) < version.parse(RSL
 
 import gymnasium as gym
 import inspect
+import numpy as np
 import os
 import shutil
 import torch
@@ -194,6 +266,179 @@ class WaypointWrapper(gym.Wrapper):
             self.waypoint_manager.reset(reset_ids)
             
         return ret
+
+
+def _to_numpy(data):
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    if isinstance(data, dict):
+        return {k: _to_numpy(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_to_numpy(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(_to_numpy(v) for v in data)
+    return data
+
+
+def _squeeze_env_dim(data):
+    if isinstance(data, np.ndarray):
+        if data.ndim > 0 and data.shape[0] == 1:
+            return data[0]
+        return data
+    if isinstance(data, dict):
+        return {k: _squeeze_env_dim(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_squeeze_env_dim(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(_squeeze_env_dim(v) for v in data)
+    return data
+
+
+def _to_scalar(data, cast_type=float):
+    value = _to_numpy(data)
+    if isinstance(value, np.ndarray):
+        flat = value.reshape(-1)
+        if flat.size == 0:
+            return cast_type(0)
+        return cast_type(flat[0])
+    return cast_type(value)
+
+
+class OffPolicyVecEnvWrapper(gym.Wrapper):
+    """Convert IsaacLab tensor-based vector env to local off-policy Gym API."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        num_envs = int(getattr(self.unwrapped, "num_envs", 1))
+        if num_envs < 1:
+            raise ValueError(f"Invalid num_envs={num_envs}. num_envs must be >= 1.")
+        self.num_envs = num_envs
+        self._sim_device = getattr(self.unwrapped, "device", "cpu")
+        self.single_observation_space = self._strip_batch_dim(self.env.observation_space, self.num_envs)
+        self.single_action_space = self._strip_batch_dim(self.env.action_space, self.num_envs)
+        # Keep SB3-style naming while preserving compatibility with local algorithms.
+        self.observation_space = self.single_observation_space
+        self.action_space = self.single_action_space
+        if not isinstance(self.single_observation_space, gym.spaces.Box):
+            raise TypeError(
+                "TD3/SAC mode currently supports Box observation spaces only. "
+                f"Got: {type(self.single_observation_space)}"
+            )
+        if not isinstance(self.single_action_space, gym.spaces.Box):
+            raise TypeError(
+                "TD3/SAC mode currently supports Box action spaces only. "
+                f"Got: {type(self.single_action_space)}"
+            )
+
+    @staticmethod
+    def _strip_batch_dim(space, num_envs: int):
+        if isinstance(space, gym.spaces.Box) and len(space.shape) > 0 and space.shape[0] == num_envs:
+            low = np.array(space.low[0], copy=True)
+            high = np.array(space.high[0], copy=True)
+            return gym.spaces.Box(low=low, high=high, dtype=space.dtype)
+        return space
+
+    def _format_action_for_env(self, action):
+        action_np = np.asarray(action, dtype=np.float32)
+        single_shape = self.single_action_space.shape
+        batched_shape = (self.num_envs, *single_shape)
+        if action_np.shape == single_shape:
+            if self.num_envs != 1:
+                raise ValueError(
+                    f"Expected batched actions with shape {batched_shape} for num_envs={self.num_envs}, "
+                    f"but got single action shape {single_shape}."
+                )
+            action_np = np.expand_dims(action_np, axis=0)
+        elif action_np.shape != batched_shape:
+            action_np = action_np.reshape(batched_shape)
+        return torch.as_tensor(action_np, device=self._sim_device)
+
+    def _to_batched_obs(self, obs):
+        obs = _to_numpy(obs)
+        obs_arr = np.asarray(obs)
+        if obs_arr.ndim == len(self.single_observation_space.shape):
+            obs_arr = np.expand_dims(obs_arr, axis=0)
+        if np.issubdtype(obs_arr.dtype, np.floating):
+            obs_arr = obs_arr.astype(np.float32, copy=False)
+        return obs_arr
+
+    def _to_batched_scalar(self, values, dtype):
+        arr = np.asarray(_to_numpy(values))
+        if arr.ndim == 0:
+            arr = np.repeat(arr.reshape(1), self.num_envs)
+        arr = arr.reshape(self.num_envs)
+        return arr.astype(dtype, copy=False)
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        obs = self._to_batched_obs(obs)
+        info = _to_numpy(info)
+        return obs, info
+
+    def step(self, action):
+        env_action = self._format_action_for_env(action)
+        obs, reward, terminated, truncated, info = self.env.step(env_action)
+        obs = self._to_batched_obs(obs)
+        info = _to_numpy(info)
+        reward = self._to_batched_scalar(reward, np.float32)
+        terminated = self._to_batched_scalar(terminated, np.bool_)
+        truncated = self._to_batched_scalar(truncated, np.bool_)
+        return obs, reward, terminated, truncated, info
+
+
+def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int | None, device: str | None):
+    from rsl_rl_woUncertainty.algorithms import SAC, TD3
+
+    wrapped_env = OffPolicyVecEnvWrapper(env)
+    tb_log_dir = os.path.join(log_dir, "tb")
+    os.makedirs(tb_log_dir, exist_ok=True)
+
+    common_kwargs = dict(
+        policy="MlpPolicy",
+        env=wrapped_env,
+        learning_rate=args_cli.offpolicy_learning_rate,
+        buffer_size=args_cli.offpolicy_buffer_size,
+        learning_starts=args_cli.offpolicy_learning_starts,
+        batch_size=args_cli.offpolicy_batch_size,
+        tau=args_cli.offpolicy_tau,
+        gamma=args_cli.offpolicy_gamma,
+        train_freq=args_cli.offpolicy_train_freq,
+        gradient_steps=args_cli.offpolicy_gradient_steps,
+        tensorboard_log=tb_log_dir,
+        verbose=1,
+        seed=seed,
+        device=device or "auto",
+    )
+
+    algo_name = algo_name.lower()
+    if algo_name == "td3":
+        model = TD3(**common_kwargs)
+        tb_name = "TD3"
+    elif algo_name == "sac":
+        model = SAC(**common_kwargs)
+        tb_name = "SAC"
+    else:
+        raise ValueError(f"Unsupported off-policy algorithm: {algo_name}")
+
+    print(
+        f"[INFO] Starting local {tb_name} training: "
+        f"total_timesteps={args_cli.offpolicy_total_timesteps}, "
+        f"log_dir={log_dir}"
+    )
+    model.learn(
+        total_timesteps=args_cli.offpolicy_total_timesteps,
+        log_interval=args_cli.offpolicy_log_interval,
+        tb_log_name=tb_name,
+    )
+
+    model_path = os.path.join(log_dir, f"{algo_name}_final_model")
+    replay_path = os.path.join(log_dir, f"{algo_name}_replay_buffer.pkl")
+    model.save(model_path)
+    # save replay buffer for optional continuation
+    save_replay_buffer = getattr(model, "save_replay_buffer", None)
+    if callable(save_replay_buffer):
+        save_replay_buffer(replay_path)
+    print(f"[INFO] Saved {tb_name} model to: {model_path}.pt")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -319,6 +564,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[ERROR] Failed to initialize Waypoint Manager: {e}")
             import traceback
             traceback.print_exc()
+
+    # Optional local off-policy branch
+    if args_cli.rl_algorithm in {"td3", "sac"}:
+        if args_cli.distributed:
+            raise ValueError("TD3/SAC mode does not support --distributed.")
+        if args_cli.resume_path:
+            print(
+                "[WARN] --resume_path is ignored in TD3/SAC mode. "
+                "Use local model loading workflow if you need resuming."
+            )
+
+        # dump config snapshots for reproducibility
+        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
+        dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+        shutil.copy(
+            inspect.getfile(env_cfg.__class__),
+            os.path.join(log_dir, "params", os.path.basename(inspect.getfile(env_cfg.__class__))),
+        )
+
+        _run_local_offpolicy_training(
+            env=env,
+            algo_name=args_cli.rl_algorithm,
+            log_dir=log_dir,
+            seed=agent_cfg.seed,
+            device=args_cli.device,
+        )
+        env.close()
+        return
 
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
