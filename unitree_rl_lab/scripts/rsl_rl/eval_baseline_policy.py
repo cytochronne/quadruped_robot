@@ -519,6 +519,7 @@ def main():
     print(f"[CHECK] Checkpoint path: {resume_path}")
 
     export_model_dir = os.path.join(log_dir, "exported")
+    onnx_path = None
     if not is_off_policy:
         try:
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
@@ -533,8 +534,9 @@ def main():
             student_exporter = _maybe_get_student_exporter(policy_nn, normalizer=normalizer)
             if student_exporter is None:
                 raise
-        onnx_path = os.path.abspath(student_exporter.export_onnx(export_model_dir, "policy.onnx"))
-    print(f"[INFO] Exported ONNX policy to: {onnx_path}")
+            onnx_path = os.path.abspath(student_exporter.export_onnx(export_model_dir, "policy.onnx"))
+    if onnx_path is not None:
+        print(f"[INFO] Exported ONNX policy to: {onnx_path}")
     
     # Initialize Waypoint Manager if enabled
     waypoint_manager = None
