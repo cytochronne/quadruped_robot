@@ -476,17 +476,22 @@ def main():
     if is_off_policy:
         algo_name = loaded_dict.get("config", {}).get("algo", "unknown")
         print(f"[INFO]: Detected off-policy checkpoint ({algo_name}), loading actor directly.")
-        obs_space = env.unwrapped.observation_space
-        act_space = env.unwrapped.action_space
-        obs_dim = obs_space["policy"].shape[0] if hasattr(obs_space, "__getitem__") else obs_space.shape[0]
-        action_dim = act_space.shape[0]
+
+        actor_state = loaded_dict["actor"]
+        action_low = actor_state["action_low"].cpu().numpy()
+        action_high = actor_state["action_high"].cpu().numpy()
+        action_dim = len(action_low)
+
         if "actor_target" in loaded_dict:
             from rsl_rl_woUncertainty.algorithms.td3 import TD3Actor
-            actor = TD3Actor(obs_dim, action_dim, act_space.low, act_space.high).to(env.unwrapped.device)
+            obs_dim = actor_state["backbone.0.weight"].shape[1]
+            actor = TD3Actor(obs_dim, action_dim, action_low, action_high).to(env.unwrapped.device)
         else:
             from rsl_rl_woUncertainty.algorithms.sac import SACActor
-            actor = SACActor(obs_dim, action_dim, act_space.low, act_space.high).to(env.unwrapped.device)
-        actor.load_state_dict(loaded_dict["actor"])
+            obs_dim = actor_state["backbone.0.weight"].shape[1]
+            actor = SACActor(obs_dim, action_dim, action_low, action_high).to(env.unwrapped.device)
+
+        actor.load_state_dict(actor_state)
         actor.eval()
         policy = lambda obs: actor(obs, deterministic=True) if hasattr(actor, "action_log_prob") else actor(obs)
         policy_nn = actor
