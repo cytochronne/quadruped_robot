@@ -176,6 +176,7 @@ class ReplayBuffer:
 class TensorboardLogger:
     def __init__(self, log_dir: str | None):
         self.writer = None
+        self.name_to_value = {}  # Store latest metric values
         if log_dir is None:
             return
         try:
@@ -187,6 +188,8 @@ class TensorboardLogger:
             self.writer = None
 
     def add_scalar(self, tag: str, value: float, step: int) -> None:
+        # Store the latest value for wandb logging
+        self.name_to_value[tag] = float(value)
         if self.writer is not None:
             self.writer.add_scalar(tag, float(value), int(step))
 

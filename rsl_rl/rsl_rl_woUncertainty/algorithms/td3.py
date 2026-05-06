@@ -231,16 +231,20 @@ class TD3:
         }
 
     def learn(self, total_timesteps: int, log_interval: int = 10, tb_log_name: str = "TD3") -> "TD3":
-        if self.seed is not None:
-            obs, _ = self.env.reset(seed=self.seed)
-        else:
-            obs, _ = self.env.reset()
-        obs_batch = self._ensure_batched_obs(obs)
+        # Only reset at the start of training, not on subsequent calls
+        if self.total_timesteps == 0:
+            if self.seed is not None:
+                obs, _ = self.env.reset(seed=self.seed)
+            else:
+                obs, _ = self.env.reset()
+            self.obs_batch = self._ensure_batched_obs(obs)
+            # Initialize episode tracking variables
+            self.episode_rewards = np.zeros(self.n_envs, dtype=np.float64)
+            self.episode_lengths = np.zeros(self.n_envs, dtype=np.int64)
+            self.ep_count = 0
+            self.ep_reward_window: deque[float] = deque(maxlen=100)
 
-        episode_rewards = np.zeros(self.n_envs, dtype=np.float64)
-        episode_lengths = np.zeros(self.n_envs, dtype=np.int64)
-        ep_count = 0
-        ep_reward_window: deque[float] = deque(maxlen=100)
+        obs_batch = self.obs_batch
 
         while self.total_timesteps < int(total_timesteps):
             if self.total_timesteps < self.learning_starts:
@@ -265,9 +269,9 @@ class TD3:
                 dones=done_batch,
             )
 
-            obs_batch = next_obs_batch
-            episode_rewards += reward_batch
-            episode_lengths += 1
+            self.obs_batch = next_obs_batch
+            self.episode_rewards += reward_batch
+            self.episode_lengths += 1
 
             if self.total_timesteps >= self.learning_starts and (self.total_env_steps + 1) % self.train_freq == 0:
                 if len(self.replay_buffer) >= self.batch_size:
@@ -278,20 +282,20 @@ class TD3:
 
             finished_indices = np.nonzero(done_batch)[0]
             for idx in finished_indices.tolist():
-                ep_count += 1
-                ep_reward = float(episode_rewards[idx])
-                ep_len = int(episode_lengths[idx])
-                ep_reward_window.append(ep_reward)
+                self.ep_count += 1
+                ep_reward = float(self.episode_rewards[idx])
+                ep_len = int(self.episode_lengths[idx])
+                self.ep_reward_window.append(ep_reward)
                 self.logger.add_scalar(f"{tb_log_name}/episode_reward", ep_reward, self.total_timesteps)
                 self.logger.add_scalar(f"{tb_log_name}/episode_length", ep_len, self.total_timesteps)
-                episode_rewards[idx] = 0.0
-                episode_lengths[idx] = 0
+                self.episode_rewards[idx] = 0.0
+                self.episode_lengths[idx] = 0
 
-            if log_interval > 0 and ep_count > 0 and ep_count % log_interval == 0 and len(ep_reward_window) > 0:
+            if log_interval > 0 and self.ep_count > 0 and self.ep_count % log_interval == 0 and len(self.ep_reward_window) > 0:
                 print(
                     f"[TD3] timesteps={self.total_timesteps} "
-                    f"episodes={ep_count} "
-                    f"mean_reward_100={float(np.mean(ep_reward_window)):.3f}"
+                    f"episodes={self.ep_count} "
+                    f"mean_reward_100={float(np.mean(self.ep_reward_window)):.3f}"
                 )
 
             self.total_env_steps += 1

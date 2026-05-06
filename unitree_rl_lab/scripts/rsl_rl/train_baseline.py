@@ -314,8 +314,11 @@ class OffPolicyVecEnvWrapper(gym.Wrapper):
             raise ValueError(f"Invalid num_envs={num_envs}. num_envs must be >= 1.")
         self.num_envs = num_envs
         self._sim_device = getattr(self.unwrapped, "device", "cpu")
-        self.single_observation_space = self._strip_batch_dim(self.env.observation_space, self.num_envs)
-        self.single_action_space = self._strip_batch_dim(self.env.action_space, self.num_envs)
+        # Flatten Dict spaces (which also handles batch dimensions)
+        obs_space = self._flatten_obs_space(self.env.observation_space, self.num_envs)
+        # Strip batch dimension if still present (for non-Dict spaces)
+        self.single_observation_space = self._strip_batch_dim(obs_space, self.num_envs)
+        self.single_action_space = self._clip_action_bounds(self._strip_batch_dim(self.env.action_space, self.num_envs))
         # Keep SB3-style naming while preserving compatibility with local algorithms.
         self.observation_space = self.single_observation_space
         self.action_space = self.single_action_space
@@ -331,10 +334,75 @@ class OffPolicyVecEnvWrapper(gym.Wrapper):
             )
 
     @staticmethod
+    def _flatten_obs_space(space, num_envs=None):
+        """Flatten a Dict observation space into a Box space."""
+        if isinstance(space, gym.spaces.Dict):
+            # Flatten Dict space to Box space
+            low = []
+            high = []
+            for subspace in space.spaces.values():
+                if isinstance(subspace, gym.spaces.Box):
+                    # Strip batch dimension if present
+                    if num_envs is not None and len(subspace.shape) > 0 and subspace.shape[0] == num_envs:
+                        single_low = np.array(subspace.low[0], copy=True)
+                        single_high = np.array(subspace.high[0], copy=True)
+                    else:
+                        single_low = np.array(subspace.low, copy=True)
+                        single_high = np.array(subspace.high, copy=True)
+                    low.extend(single_low.flatten())
+                    high.extend(single_high.flatten())
+                else:
+                    raise TypeError(f"Unsupported space type inside Dict: {type(subspace)}")
+            low = np.array(low, dtype=np.float32)
+            high = np.array(high, dtype=np.float32)
+            return gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        return space
+
+    def _flatten_obs(self, obs):
+        """Flatten a Dict observation into a flat array."""
+        if isinstance(obs, dict):
+            # Process each observation in the dict
+            flattened_list = []
+            for key in sorted(obs.keys()):  # Sort keys for consistent ordering
+                value = obs[key]
+                if isinstance(value, torch.Tensor):
+                    value_np = value.cpu().numpy()
+                else:
+                    value_np = np.asarray(value)
+
+                # Handle batch dimension
+                if value_np.ndim > 1 and value_np.shape[0] == self.num_envs:
+                    # Shape: (num_envs, ...) -> (num_envs, flat_obs_dim)
+                    flat_obs = value_np.reshape(self.num_envs, -1)
+                else:
+                    # Single observation - flatten and add batch dimension
+                    flat_obs = value_np.flatten()
+                    flat_obs = np.expand_dims(flat_obs, axis=0).repeat(self.num_envs, axis=0)
+
+                flattened_list.append(flat_obs)
+
+            # Concatenate all observations along the feature dimension
+            # Result shape: (num_envs, total_obs_dim)
+            return np.concatenate(flattened_list, axis=1)
+        return obs
+
+    @staticmethod
     def _strip_batch_dim(space, num_envs: int):
         if isinstance(space, gym.spaces.Box) and len(space.shape) > 0 and space.shape[0] == num_envs:
             low = np.array(space.low[0], copy=True)
             high = np.array(space.high[0], copy=True)
+            return gym.spaces.Box(low=low, high=high, dtype=space.dtype)
+        return space
+
+    @staticmethod
+    def _clip_action_bounds(space):
+        """Clip infinite action bounds to [-1, 1] for TD3/SAC compatibility."""
+        if isinstance(space, gym.spaces.Box):
+            low = np.array(space.low, copy=True)
+            high = np.array(space.high, copy=True)
+            # Replace -inf with -1.0 and inf with 1.0
+            low = np.where(np.isinf(low) & (low < 0), -1.0, low)
+            high = np.where(np.isinf(high) & (high > 0), 1.0, high)
             return gym.spaces.Box(low=low, high=high, dtype=space.dtype)
         return space
 
@@ -354,6 +422,8 @@ class OffPolicyVecEnvWrapper(gym.Wrapper):
         return torch.as_tensor(action_np, device=self._sim_device)
 
     def _to_batched_obs(self, obs):
+        # First flatten Dict observations
+        obs = self._flatten_obs(obs)
         obs = _to_numpy(obs)
         obs_arr = np.asarray(obs)
         if obs_arr.ndim == len(self.single_observation_space.shape):
@@ -377,25 +447,218 @@ class OffPolicyVecEnvWrapper(gym.Wrapper):
 
     def step(self, action):
         env_action = self._format_action_for_env(action)
-        obs, reward, terminated, truncated, info = self.env.step(env_action)
+
+        # Check episode_length_buf BEFORE step to detect resets
+        ep_len_before = None
+        if hasattr(self.env.unwrapped, "episode_length_buf"):
+            ep_len_before = self.env.unwrapped.episode_length_buf.clone() if isinstance(self.env.unwrapped.episode_length_buf, torch.Tensor) else self.env.unwrapped.episode_length_buf.copy()
+
+        # Handle both old (4-value) and new (5-value) Gym APIs
+        result = self.env.step(env_action)
+
+        if len(result) == 4:
+            # Old Gym API: (obs, reward, done, info)
+            obs, reward, done, info = result
+            terminated = done
+            truncated = torch.zeros_like(done) if isinstance(done, torch.Tensor) else np.zeros_like(done, dtype=bool)
+        elif len(result) == 5:
+            # New Gym API: (obs, reward, terminated, truncated, info)
+            obs, reward, terminated, truncated, info = result
+            done = terminated | truncated
+        else:
+            raise ValueError(f"Unexpected number of return values from env.step(): {len(result)}")
+
+        # Detect resets by comparing episode_length_buf before and after
+        # If ep_len decreased, it means the environment was reset internally
+        if ep_len_before is not None and hasattr(self.env.unwrapped, "episode_length_buf"):
+            ep_len_after = self.env.unwrapped.episode_length_buf
+            if isinstance(ep_len_after, torch.Tensor) and isinstance(ep_len_before, torch.Tensor):
+                # Detect which envs had their episode_length decrease (means reset happened)
+                just_reset = ep_len_after < ep_len_before
+
+                if just_reset.any():
+                    just_reset_np = just_reset.cpu().numpy()
+                    # Convert terminated/truncated to numpy first (handle CUDA tensors)
+                    if isinstance(terminated, torch.Tensor):
+                        terminated = terminated.cpu().numpy()
+                    if isinstance(truncated, torch.Tensor):
+                        truncated = truncated.cpu().numpy()
+                    terminated = np.asarray(terminated, dtype=bool).reshape(self.num_envs)
+                    truncated = np.asarray(truncated, dtype=bool).reshape(self.num_envs)
+                    # For IsaacLab, timeout is the main reason for reset
+                    truncated = truncated | just_reset_np
+
+        # Convert observations
         obs = self._to_batched_obs(obs)
         info = _to_numpy(info)
-        reward = self._to_batched_scalar(reward, np.float32)
-        terminated = self._to_batched_scalar(terminated, np.bool_)
-        truncated = self._to_batched_scalar(truncated, np.bool_)
+        reward = self._to_batched_scalar(reward, np.float32) 
+
+        # Convert terminated/truncated to numpy
+        if isinstance(terminated, torch.Tensor):
+            terminated = _to_numpy(terminated)
+        if isinstance(truncated, torch.Tensor):
+            truncated = _to_numpy(truncated)
+
+        # Ensure they're boolean arrays of shape (num_envs,)
+        terminated = np.asarray(terminated, dtype=bool).reshape(self.num_envs)
+        truncated = np.asarray(truncated, dtype=bool).reshape(self.num_envs)
+
         return obs, reward, terminated, truncated, info
 
 
-def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int | None, device: str | None):
+def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int | None, device: str | None, wandb_project: str | None = None):
     from rsl_rl_woUncertainty.algorithms import SAC, TD3
+    import wandb
+    from collections import deque
+    import statistics
+    import time
 
+    # Wrap environment to collect metrics - similar to PPO's approach
+    class WandbLoggingWrapper(gym.Wrapper):
+        def __init__(self, env, num_envs):
+            super().__init__(env)
+            self.num_envs = num_envs
+            # Episode storage (like PPO)
+            self.ep_infos = []
+            self.rewbuffer = deque(maxlen=100)
+            self.lenbuffer = deque(maxlen=100)
+
+            self.cur_reward_sum = np.zeros(num_envs, dtype=np.float32)
+            self.cur_episode_length = np.zeros(num_envs, dtype=np.float32)
+            self._total_episodes_completed = 0
+            self.start_time = time.time()
+
+        def reset(self, **kwargs):
+            obs, info = self.env.reset(**kwargs)
+            self.cur_reward_sum[:] = 0
+            self.cur_episode_length[:] = 0
+            return obs, info
+
+        def step(self, action):
+            obs, reward, terminated, truncated, info = super().step(action)
+            dones = terminated | truncated
+
+            # Update episode stats
+            self.cur_reward_sum += reward
+            self.cur_episode_length += 1
+
+            # Collect log info like PPO does
+            if "log" in info:
+                self.ep_infos.append(info["log"])
+
+            # Process completed episodes
+            done_ids = np.where(dones)[0]
+            if len(done_ids) > 0:
+                # Update total episode counter
+                self._total_episodes_completed += len(done_ids)
+
+                for i in done_ids:
+                    self.rewbuffer.append(self.cur_reward_sum[i])
+                    self.lenbuffer.append(self.cur_episode_length[i])
+                    self.cur_reward_sum[i] = 0
+                    self.cur_episode_length[i] = 0
+
+            return obs, reward, terminated, truncated, info
+
+        def get_metrics(self):
+            """Process metrics like PPO's log method."""
+            metrics = {}
+
+            # Episode-based metrics
+            if len(self.rewbuffer) > 0:
+                metrics["Train/mean_reward"] = float(np.mean(self.rewbuffer))
+                metrics["Train/std_reward"] = float(np.std(self.rewbuffer))
+            if len(self.lenbuffer) > 0:
+                metrics["Train/mean_episode_length"] = float(np.mean(self.lenbuffer))
+                metrics["Train/episode_length_max"] = float(np.max(self.lenbuffer))
+
+            # Total episode count
+            if hasattr(self, '_total_episodes_completed'):
+                metrics["Train/num_episodes"] = self._total_episodes_completed
+
+            # Process ep_infos like PPO does (lines 300-319 in on_policy_runner.py)
+            if self.ep_infos:
+                # Get all unique keys from all log dicts
+                all_keys = set()
+                for ep_info in self.ep_infos:
+                    if isinstance(ep_info, dict):
+                        all_keys.update(ep_info.keys())
+
+                # For each key, compute mean across all episodes
+                for key in all_keys:
+                    values = []
+                    for ep_info in self.ep_infos:
+                        if isinstance(ep_info, dict) and key in ep_info:
+                            val = ep_info[key]
+                            # Handle different value types
+                            if isinstance(val, (int, float, np.number)):
+                                values.append(float(val))
+                            elif isinstance(val, torch.Tensor):
+                                if val.numel() == 1:
+                                    values.append(float(val.item()))
+                            elif isinstance(val, np.ndarray):
+                                if val.ndim == 0 or val.size == 1:
+                                    values.append(float(val.item()))
+                                else:
+                                    # For arrays, take mean
+                                    values.append(float(np.mean(val)))
+
+                    if values:
+                        mean_val = float(np.mean(values))
+                        # Use PPO's naming convention
+                        if "/" in key:
+                            metrics[key] = mean_val
+                        else:
+                            metrics[f"Episode/{key}"] = mean_val
+
+            # Clear ep_infos after processing
+            self.ep_infos.clear()
+
+            return metrics
+
+    # Wrap the environment
     wrapped_env = OffPolicyVecEnvWrapper(env)
-    tb_log_dir = os.path.join(log_dir, "tb")
-    os.makedirs(tb_log_dir, exist_ok=True)
+    logged_env = WandbLoggingWrapper(wrapped_env, wrapped_env.num_envs)
 
+    # Print environment info
+    print(f"[INFO] Environment: num_envs={logged_env.num_envs}")
+    if hasattr(env.unwrapped, "max_episode_length"):
+        print(f"[INFO] max_episode_length: {env.unwrapped.max_episode_length}")
+    if hasattr(env.unwrapped, "episode_length_s"):
+        print(f"[INFO] episode_length_s: {env.unwrapped.episode_length_s}")
+    if hasattr(env, "episode_length_buf"):
+        print(f"[INFO] episode_length_buf: {env.episode_length_buf}")
+        print(f"[INFO] episode_length_buf shape: {env.episode_length_buf.shape}")
+        print(f"[INFO] episode_length_buf dtype: {env.episode_length_buf.dtype}")
+    if hasattr(env.unwrapped, "common_step_counter"):
+        print(f"[INFO] common_step_counter: {env.unwrapped.common_step_counter}")
+
+    # Initialize wandb
+    run_name = os.path.split(log_dir)[-1]
+    wandb_project = wandb_project or "unitree_rl_lab"
+    wandb_entity = os.environ.get("WANDB_USERNAME") or os.environ.get("WANDB_ENTITY")
+
+    wandb.init(
+        project=wandb_project,
+        entity=wandb_entity,
+        name=run_name,
+        dir=log_dir,
+        config={
+            "log_dir": log_dir,
+            "algorithm": algo_name,
+            "total_timesteps": args_cli.offpolicy_total_timesteps,
+            "learning_rate": args_cli.offpolicy_learning_rate,
+            "buffer_size": args_cli.offpolicy_buffer_size,
+            "batch_size": args_cli.offpolicy_batch_size,
+            "learning_starts": args_cli.offpolicy_learning_starts,
+            "num_envs": logged_env.num_envs,
+        }
+    )
+
+    # Common kwargs for TD3/SAC
     common_kwargs = dict(
         policy="MlpPolicy",
-        env=wrapped_env,
+        env=logged_env,
         learning_rate=args_cli.offpolicy_learning_rate,
         buffer_size=args_cli.offpolicy_buffer_size,
         learning_starts=args_cli.offpolicy_learning_starts,
@@ -404,7 +667,6 @@ def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int |
         gamma=args_cli.offpolicy_gamma,
         train_freq=args_cli.offpolicy_train_freq,
         gradient_steps=args_cli.offpolicy_gradient_steps,
-        tensorboard_log=tb_log_dir,
         verbose=1,
         seed=seed,
         device=device or "auto",
@@ -421,24 +683,136 @@ def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int |
         raise ValueError(f"Unsupported off-policy algorithm: {algo_name}")
 
     print(
-        f"[INFO] Starting local {tb_name} training: "
+        f"[INFO] Starting local {tb_name} training with wandb: "
         f"total_timesteps={args_cli.offpolicy_total_timesteps}, "
-        f"log_dir={log_dir}"
-    )
-    model.learn(
-        total_timesteps=args_cli.offpolicy_total_timesteps,
-        log_interval=args_cli.offpolicy_log_interval,
-        tb_log_name=tb_name,
+        f"log_dir={log_dir}, "
+        f"wandb_project={wandb_project}"
     )
 
+    # Custom learn with wandb logging
+    total_timesteps = args_cli.offpolicy_total_timesteps
+    # Use a reasonable log interval (e.g., every 5000 environment steps)
+    wandb_log_interval = 5000
+
+    print(f"[INFO] Starting training: {total_timesteps} timesteps, log every {wandb_log_interval} steps")
+
+    # Store current progress
+    last_logged_step = 0
+
+    while model.total_timesteps < total_timesteps:
+        # Calculate next target
+        next_target = min(model.total_timesteps + wandb_log_interval, total_timesteps)
+
+        # Train for this segment
+        model.learn(
+            total_timesteps=next_target,
+            log_interval=999999,  # Disable internal logging
+        )
+
+        # Log metrics after each segment
+        metrics = logged_env.get_metrics()
+        metrics["Train/timestep"] = model.total_timesteps
+
+        # Check environment episode length for debugging
+        if hasattr(logged_env.env.unwrapped, "episode_length_buf"):
+            ep_len_buf = logged_env.env.unwrapped.episode_length_buf.cpu().numpy()
+            metrics["Train/episode_length_max"] = float(np.max(ep_len_buf))
+            metrics["Train/episode_length_mean"] = float(np.mean(ep_len_buf))
+            if hasattr(logged_env.env.unwrapped, "max_episode_length"):
+                max_ep_len = logged_env.env.unwrapped.max_episode_length
+                metrics["Train/episode_length_max_ratio"] = float(np.max(ep_len_buf) / max_ep_len)
+
+        # Performance metrics
+        elapsed_time = time.time() - logged_env.start_time
+        fps = model.total_timesteps / elapsed_time if elapsed_time > 0 else 0
+        metrics["Perf/total_fps"] = fps
+
+        # Log model-specific metrics (losses, etc.)
+        if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
+            logger_metrics_count = 0
+            for key, value in model.logger.name_to_value.items():
+                if not np.isnan(value):
+                    logger_metrics_count += 1
+                    # Remove algorithm prefix
+                    clean_key = key
+                    for algo in ["TD3", "SAC", "td3", "sac"]:
+                        if key.startswith(f"{algo}/"):
+                            clean_key = key[len(f"{algo}/"):]
+                            break
+                    # Categorize metrics
+                    if "critic_loss" in clean_key or "value_loss" in clean_key:
+                        metrics["Loss/value_loss"] = value
+                    elif "actor_loss" in clean_key or "policy_loss" in clean_key or "surrogate" in clean_key:
+                        metrics["Loss/policy_loss"] = value
+                    elif "ent_coef" in clean_key and "loss" not in clean_key:
+                        metrics["Loss/entropy_coef"] = value
+                    elif "ent_coef_loss" in clean_key:
+                        metrics["Loss/entropy_coef_loss"] = value
+                    elif "episode_reward" in clean_key:
+                        metrics["Train/episode_reward"] = value
+                    elif "episode_length" in clean_key:
+                        metrics["Train/episode_length"] = value
+                    else:
+                        metrics[f"Train/{clean_key}"] = value
+
+        wandb.log(metrics)
+
+        # Print summary
+        mean_reward = metrics.get('Train/mean_reward', 'N/A')
+        if mean_reward != 'N/A':
+            reward_str = f"{mean_reward:.2f}"
+        else:
+            reward_str = 'N/A'
+
+        loss_info = []
+        if 'Loss/value_loss' in metrics:
+            loss_info.append(f"critic={metrics['Loss/value_loss']:.4f}")
+        if 'Loss/policy_loss' in metrics:
+            loss_info.append(f"actor={metrics['Loss/policy_loss']:.4f}")
+        if 'Loss/entropy_coef' in metrics:
+            loss_info.append(f"ent={metrics['Loss/entropy_coef']:.4f}")
+
+        loss_str = ", ".join(loss_info) if loss_info else "no losses yet"
+
+        env_info = []
+        for key in list(metrics.keys()):
+            if key.startswith("Env/") or key.startswith("Curriculum/") or key.startswith("Reward/"):
+                k = key.split('/', 1)[1] if '/' in key else key
+                env_info.append(f"{k}={metrics[key]:.3f}")
+                if len(env_info) >= 5:
+                    break
+
+        env_str = ", ".join(env_info) if env_info else ""
+
+        # Episode stats
+        max_ep_len = metrics.get('Train/episode_length_max', 0)
+        ep_stats = f", EpDone={metrics.get('Train/num_episodes', 0)}, MaxEpLen={max_ep_len:.0f}"
+
+        print(f"[INFO] Step {model.total_timesteps}/{total_timesteps}, "
+              f"Reward: {reward_str}, "
+              f"FPS: {fps:.0f}, "
+              f"{loss_str}"
+              + (f", {env_str}" if env_str else "")
+              + ep_stats)
+
+    # Save model
     model_path = os.path.join(log_dir, f"{algo_name}_final_model")
     replay_path = os.path.join(log_dir, f"{algo_name}_replay_buffer.pkl")
     model.save(model_path)
-    # save replay buffer for optional continuation
+
+    # Save to wandb
+    wandb.save(model_path + ".zip", base_path=log_dir)
+
+    # Save replay buffer for optional continuation
     save_replay_buffer = getattr(model, "save_replay_buffer", None)
     if callable(save_replay_buffer):
         save_replay_buffer(replay_path)
+        wandb.save(replay_path, base_path=log_dir)
+
     print(f"[INFO] Saved {tb_name} model to: {model_path}.pt")
+
+    # Finish wandb run
+    wandb.finish()
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -591,6 +965,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             log_dir=log_dir,
             seed=agent_cfg.seed,
             device=args_cli.device,
+            wandb_project=agent_cfg.wandb_project,
         )
         env.close()
         return

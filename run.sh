@@ -19,7 +19,7 @@ UNITREE_RL_LAB_DIR="${PROJECT_ROOT}/unitree_rl_lab"
 
 export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v anaconda3 | paste -sd:)
 
-cd "${UNITREE_RL_LAB_DIR}"
+cd unitree_rl_lab
 
 echo "enter unitree_rl_lab directory"
 
@@ -48,14 +48,14 @@ echo "enter unitree_rl_lab directory"
                                     #--resume_path /home/dataset/yanzhe/SEAMPlog/rsl_rl/unitree_go2_velocity/2026-01-09_15-32-23_teacher_addWaypoints/model_10100.pt
 
 #baseline evaluation命令，使用训练好的baseline模型进行评估,可以得到onnx
-python scripts/rsl_rl/eval_baseline_policy.py \
-    --task Unitree-Go2-Velocity-lab-Rough-Env-v0 \
-    --checkpoint  ${PROJECT_ROOT}/unitree_rl_lab/logs/student_baseline/rsl_rl_MLE/unitree_go2_velocity_lab_rough_env_v0/2026-04-21_09-44-33_baseline_bc_initnoise0.1/model_2000.pt \
-    --eval_duration 200.0 \
-    --num_envs 2048 \
-    --device cuda:4 \
-    --headless \
-    #--track_waypoints
+# python scripts/rsl_rl/eval_baseline_policy.py \
+#     --task Unitree-Go2-Velocity-lab-Rough-Env-v0 \
+#     --checkpoint  ${PROJECT_ROOT}/unitree_rl_lab/logs/student_baseline/rsl_rl_MLE/unitree_go2_velocity_lab_rough_env_v0/2026-04-21_09-44-33_baseline_bc_initnoise0.1/model_2000.pt \
+#     --eval_duration 200.0 \
+#     --num_envs 2048 \
+#     --device cuda:4 \
+#     --headless \
+#     #--track_waypoints
 
 
 
@@ -104,22 +104,30 @@ python scripts/rsl_rl/eval_baseline_policy.py \
 
 
 # baseline TD3训练命令（本地 off-policy 实现，多环境）
-# python scripts/rsl_rl/train_baseline.py --headless --task Unitree-Go2-Velocity-lab-Rough-Env-v0 --num_envs 4096 --log_root ${PROJECT_ROOT}/unitree_rl_lab/logs/student_baseline \
-#                                     --run_name baseline_td3 \
-#                                     --device cuda:6 \
-#                                     --rl_algorithm td3 \
-#                                     --offpolicy_total_timesteps 1000000 \
-#                                     --offpolicy_learning_rate 3e-4 \
-#                                     --offpolicy_batch_size 256 \
-#                                     --offpolicy_learning_starts 10000
+# 配置: 983M timesteps, 与PPO 10k迭代训练量相当
+python scripts/rsl_rl/train_baseline.py --headless --task Unitree-Go2-Velocity-lab-Rough-Env-v0 --num_envs 4096 --log_root ${PROJECT_ROOT}/unitree_rl_lab/logs/student_baseline \
+                                    --run_name baseline_td3_10k_equiv \
+                                    --device cuda:6 \
+                                    --rl_algorithm td3 \
+                                    --offpolicy_total_timesteps 983000000 \
+                                    --offpolicy_learning_rate 3e-4 \
+                                    --offpolicy_batch_size 4096 \
+                                    --offpolicy_buffer_size 2000000 \
+                                    --offpolicy_learning_starts 50000 \
+                                    --offpolicy_train_freq 1 \
+                                    --offpolicy_gradient_steps 1
 
 
 # baseline SAC训练命令（本地 off-policy 实现，多环境）
+# 配置: 983M timesteps, 与PPO 10k迭代训练量相当
 # python scripts/rsl_rl/train_baseline.py --headless --task Unitree-Go2-Velocity-lab-Rough-Env-v0 --num_envs 4096 --log_root ${PROJECT_ROOT}/unitree_rl_lab/logs/student_baseline \
-#                                     --run_name baseline_sac \
+#                                     --run_name baseline_sac_10k_equiv \
 #                                     --device cuda:6 \
 #                                     --rl_algorithm sac \
-#                                     --offpolicy_total_timesteps 1000000 \
+#                                     --offpolicy_total_timesteps 983000000 \
 #                                     --offpolicy_learning_rate 3e-4 \
-#                                     --offpolicy_batch_size 256 \
-#                                     --offpolicy_learning_starts 10000
+#                                     --offpolicy_batch_size 4096 \
+#                                     --offpolicy_buffer_size 3000000 \
+#                                     --offpolicy_learning_starts 50000 \
+#                                     --offpolicy_train_freq 1 \
+#                                     --offpolicy_gradient_steps 1
