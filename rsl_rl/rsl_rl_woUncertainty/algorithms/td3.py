@@ -171,6 +171,57 @@ class TD3:
             np.float32
         )
 
+    def _apply_terminal_obs_and_timeouts(
+        self,
+        infos,
+        next_obs_batch: np.ndarray,
+        done_batch: np.ndarray,
+        timeout_batch: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Align with SB3-style info fields when available."""
+        if infos is None:
+            return next_obs_batch, timeout_batch
+
+        if isinstance(infos, (list, tuple)):
+            for idx in range(min(self.n_envs, len(infos))):
+                if not done_batch[idx]:
+                    continue
+                info_i = infos[idx]
+                if not isinstance(info_i, dict):
+                    continue
+                if "TimeLimit.truncated" in info_i:
+                    timeout_batch[idx] = bool(info_i["TimeLimit.truncated"])
+                terminal_obs = info_i.get("terminal_observation")
+                if terminal_obs is not None:
+                    terminal_obs_arr = np.asarray(terminal_obs, dtype=np.float32).reshape(self.obs_shape)
+                    next_obs_batch[idx] = terminal_obs_arr
+            return next_obs_batch, timeout_batch
+
+        if isinstance(infos, dict):
+            if "TimeLimit.truncated" in infos:
+                timeout_batch = np.asarray(infos["TimeLimit.truncated"], dtype=bool).reshape(self.n_envs)
+
+            terminal_obs_batch = infos.get("terminal_observation")
+            if terminal_obs_batch is not None:
+                if isinstance(terminal_obs_batch, np.ndarray) and terminal_obs_batch.shape[0] == self.n_envs:
+                    iterable = [terminal_obs_batch[i] for i in range(self.n_envs)]
+                elif isinstance(terminal_obs_batch, (list, tuple)) and len(terminal_obs_batch) == self.n_envs:
+                    iterable = terminal_obs_batch
+                else:
+                    iterable = None
+
+                if iterable is not None:
+                    for idx in range(self.n_envs):
+                        if not done_batch[idx]:
+                            continue
+                        term_obs = iterable[idx]
+                        if term_obs is None:
+                            continue
+                        term_obs_arr = np.asarray(term_obs, dtype=np.float32).reshape(self.obs_shape)
+                        next_obs_batch[idx] = term_obs_arr
+
+        return next_obs_batch, timeout_batch
+
     def _predict_actions(self, obs_batch: np.ndarray, deterministic: bool = False) -> np.ndarray:
         obs_t = torch.as_tensor(obs_batch.reshape(self.n_envs, -1), dtype=torch.float32, device=self.device)
         with torch.no_grad():
@@ -189,7 +240,7 @@ class TD3:
             noise = torch.randn_like(batch.actions.reshape(self.batch_size, -1)) * (
                 self.target_policy_noise * self.actor.action_scale.view(1, -1)
             )
-            noise_clip = self.target_noise_clip * self.actor.action_scale.view(1, -1)
+            noise_clip = self.target_noise_clip
             noise = torch.clamp(noise, -noise_clip, noise_clip)
 
             next_obs = batch.next_observations.reshape(self.batch_size, -1)
@@ -205,14 +256,15 @@ class TD3:
         actions = batch.actions.reshape(self.batch_size, -1)
 
         current_q1, current_q2 = self.critic(observations, actions)
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        critic_loss = 0.5 * (F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q))
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
         actor_loss_value = 0.0
-        if self.total_updates % self.policy_delay == 0:
+        update_index = self.total_updates + 1
+        if update_index % self.policy_delay == 0:
             pred_actions = self.actor(observations)
             actor_loss = -self.critic.q1_forward(observations, pred_actions).mean()
 
@@ -224,7 +276,7 @@ class TD3:
             polyak_update(self.actor, self.actor_target, self.tau)
             actor_loss_value = float(actor_loss.item())
 
-        self.total_updates += 1
+        self.total_updates = update_index
         return {
             "critic_loss": float(critic_loss.item()),
             "actor_loss": actor_loss_value,
@@ -253,13 +305,20 @@ class TD3:
                 action_batch_flat = self._predict_actions(obs_batch, deterministic=False)
 
             env_action_batch = self._reshape_action_batch(action_batch_flat)
-            next_obs, reward, terminated, truncated, _ = self.env.step(env_action_batch)
+            next_obs, reward, terminated, truncated, infos = self.env.step(env_action_batch)
             next_obs_batch = self._ensure_batched_obs(next_obs)
 
             reward_batch = np.asarray(reward, dtype=np.float32).reshape(self.n_envs)
             terminated_batch = np.asarray(terminated, dtype=bool).reshape(self.n_envs)
             truncated_batch = np.asarray(truncated, dtype=bool).reshape(self.n_envs)
             done_batch = np.logical_or(terminated_batch, truncated_batch)
+            timeout_batch = np.logical_and(truncated_batch, np.logical_not(terminated_batch))
+            next_obs_batch, timeout_batch = self._apply_terminal_obs_and_timeouts(
+                infos=infos,
+                next_obs_batch=next_obs_batch,
+                done_batch=done_batch,
+                timeout_batch=timeout_batch,
+            )
 
             self.replay_buffer.add_batch(
                 observations=obs_batch,
@@ -267,18 +326,23 @@ class TD3:
                 rewards=reward_batch,
                 next_observations=next_obs_batch,
                 dones=done_batch,
+                timeouts=timeout_batch,
             )
 
             self.obs_batch = next_obs_batch
+            obs_batch = next_obs_batch
             self.episode_rewards += reward_batch
             self.episode_lengths += 1
 
-            if self.total_timesteps >= self.learning_starts and (self.total_env_steps + 1) % self.train_freq == 0:
+            post_step_timesteps = self.total_timesteps + self.n_envs
+            if post_step_timesteps > self.learning_starts and (self.total_env_steps + 1) % self.train_freq == 0:
                 if len(self.replay_buffer) >= self.batch_size:
-                    for _ in range(self.gradient_steps):
-                        metrics = self._train_step()
-                    self.logger.add_scalar(f"{tb_log_name}/critic_loss", metrics["critic_loss"], self.total_timesteps)
-                    self.logger.add_scalar(f"{tb_log_name}/actor_loss", metrics["actor_loss"], self.total_timesteps)
+                    gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else self.train_freq * self.n_envs
+                    if gradient_steps > 0:
+                        for _ in range(gradient_steps):
+                            metrics = self._train_step()
+                        self.logger.add_scalar(f"{tb_log_name}/critic_loss", metrics["critic_loss"], self.total_timesteps)
+                        self.logger.add_scalar(f"{tb_log_name}/actor_loss", metrics["actor_loss"], self.total_timesteps)
 
             finished_indices = np.nonzero(done_batch)[0]
             for idx in finished_indices.tolist():

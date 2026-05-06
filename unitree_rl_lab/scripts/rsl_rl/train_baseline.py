@@ -125,6 +125,12 @@ parser.add_argument(
     default=10,
     help="Logging interval used by local TD3/SAC learn().",
 )
+parser.add_argument(
+    "--offpolicy_save_interval",
+    type=int,
+    default=5000,
+    help="Checkpoint save interval (in off-policy segments) for local TD3/SAC.",
+)
 
 
 
@@ -506,7 +512,15 @@ class OffPolicyVecEnvWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int | None, device: str | None, wandb_project: str | None = None):
+def _run_local_offpolicy_training(
+    env,
+    algo_name: str,
+    log_dir: str,
+    seed: int | None,
+    device: str | None,
+    wandb_project: str | None = None,
+    save_interval: int = 5000,
+):
     from rsl_rl_woUncertainty.algorithms import SAC, TD3
     import wandb
     from collections import deque
@@ -652,6 +666,7 @@ def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int |
             "batch_size": args_cli.offpolicy_batch_size,
             "learning_starts": args_cli.offpolicy_learning_starts,
             "num_envs": logged_env.num_envs,
+            "save_interval": save_interval,
         }
     )
 
@@ -691,13 +706,17 @@ def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int |
 
     # Custom learn with wandb logging
     total_timesteps = args_cli.offpolicy_total_timesteps
+    save_interval = max(1, int(save_interval))
     # Use a reasonable log interval (e.g., every 5000 environment steps)
     wandb_log_interval = 5000
 
-    print(f"[INFO] Starting training: {total_timesteps} timesteps, log every {wandb_log_interval} steps")
+    print(
+        f"[INFO] Starting training: {total_timesteps} timesteps, "
+        f"log every {wandb_log_interval} steps, "
+        f"checkpoint every {save_interval} iterations"
+    )
 
-    # Store current progress
-    last_logged_step = 0
+    offpolicy_it = 0
 
     while model.total_timesteps < total_timesteps:
         # Calculate next target
@@ -795,13 +814,30 @@ def _run_local_offpolicy_training(env, algo_name: str, log_dir: str, seed: int |
               + (f", {env_str}" if env_str else "")
               + ep_stats)
 
+        # Save checkpoints like PPO: model_{it}.pt every save_interval iterations.
+        if offpolicy_it % save_interval == 0:
+            checkpoint_path = os.path.join(log_dir, f"model_{offpolicy_it}.pt")
+            model.save(checkpoint_path)
+            wandb.save(checkpoint_path, base_path=log_dir)
+            print(f"[INFO] Saved checkpoint: {checkpoint_path}")
+
+        offpolicy_it += 1
+
+    # Save final checkpoint like PPO: model_{final_it}.pt
+    final_it = max(offpolicy_it - 1, 0)
+    final_checkpoint_path = os.path.join(log_dir, f"model_{final_it}.pt")
+    if not os.path.exists(final_checkpoint_path):
+        model.save(final_checkpoint_path)
+        wandb.save(final_checkpoint_path, base_path=log_dir)
+        print(f"[INFO] Saved final checkpoint: {final_checkpoint_path}")
+
     # Save model
     model_path = os.path.join(log_dir, f"{algo_name}_final_model")
     replay_path = os.path.join(log_dir, f"{algo_name}_replay_buffer.pkl")
     model.save(model_path)
 
     # Save to wandb
-    wandb.save(model_path + ".zip", base_path=log_dir)
+    wandb.save(model_path + ".pt", base_path=log_dir)
 
     # Save replay buffer for optional continuation
     save_replay_buffer = getattr(model, "save_replay_buffer", None)
@@ -966,6 +1002,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             seed=agent_cfg.seed,
             device=args_cli.device,
             wandb_project=agent_cfg.wandb_project,
+            save_interval=args_cli.offpolicy_save_interval,
         )
         env.close()
         return

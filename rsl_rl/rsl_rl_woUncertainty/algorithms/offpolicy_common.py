@@ -84,26 +84,33 @@ class ReplayBuffer:
         self.rewards = np.zeros((self.capacity, 1), dtype=np.float32)
         self.next_observations = np.zeros((self.capacity, *obs_shape), dtype=np.float32)
         self.dones = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.timeouts = np.zeros((self.capacity, 1), dtype=np.float32)
 
         self.pos = 0
         self.size = 0
 
-    def add(self, obs, action, reward: float, next_obs, done: bool) -> None:
+    def add(self, obs, action, reward: float, next_obs, done: bool, timeout: bool = False) -> None:
         self.observations[self.pos] = np.asarray(obs, dtype=np.float32)
         self.actions[self.pos] = np.asarray(action, dtype=np.float32)
         self.rewards[self.pos, 0] = float(reward)
         self.next_observations[self.pos] = np.asarray(next_obs, dtype=np.float32)
         self.dones[self.pos, 0] = float(done)
+        self.timeouts[self.pos, 0] = float(timeout)
 
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def add_batch(self, observations, actions, rewards, next_observations, dones) -> None:
+    def add_batch(self, observations, actions, rewards, next_observations, dones, timeouts=None) -> None:
         obs_batch = np.asarray(observations, dtype=np.float32)
         action_batch = np.asarray(actions, dtype=np.float32)
         reward_batch = np.asarray(rewards, dtype=np.float32).reshape(-1, 1)
         next_obs_batch = np.asarray(next_observations, dtype=np.float32)
         done_batch = np.asarray(dones, dtype=np.float32).reshape(-1, 1)
+        timeout_batch = (
+            np.zeros_like(done_batch, dtype=np.float32)
+            if timeouts is None
+            else np.asarray(timeouts, dtype=np.float32).reshape(-1, 1)
+        )
 
         if obs_batch.ndim == len(self.obs_shape):
             obs_batch = np.expand_dims(obs_batch, axis=0)
@@ -111,6 +118,7 @@ class ReplayBuffer:
             reward_batch = reward_batch.reshape(1, 1)
             next_obs_batch = np.expand_dims(next_obs_batch, axis=0)
             done_batch = done_batch.reshape(1, 1)
+            timeout_batch = timeout_batch.reshape(1, 1)
 
         batch_size = int(obs_batch.shape[0])
         if batch_size <= 0:
@@ -122,6 +130,7 @@ class ReplayBuffer:
             reward_batch = reward_batch[-self.capacity :]
             next_obs_batch = next_obs_batch[-self.capacity :]
             done_batch = done_batch[-self.capacity :]
+            timeout_batch = timeout_batch[-self.capacity :]
             batch_size = self.capacity
 
         indices = (np.arange(batch_size) + self.pos) % self.capacity
@@ -130,6 +139,7 @@ class ReplayBuffer:
         self.rewards[indices] = reward_batch
         self.next_observations[indices] = next_obs_batch
         self.dones[indices] = done_batch
+        self.timeouts[indices] = timeout_batch
 
         self.pos = (self.pos + batch_size) % self.capacity
         self.size = min(self.size + batch_size, self.capacity)
@@ -138,12 +148,13 @@ class ReplayBuffer:
         if self.size == 0:
             raise RuntimeError("Cannot sample from an empty replay buffer.")
         indices = np.random.randint(0, self.size, size=int(batch_size))
+        dones = self.dones[indices] * (1.0 - self.timeouts[indices])
         return ReplayBatch(
             observations=torch.as_tensor(self.observations[indices], device=self.device),
             actions=torch.as_tensor(self.actions[indices], device=self.device),
             rewards=torch.as_tensor(self.rewards[indices], device=self.device),
             next_observations=torch.as_tensor(self.next_observations[indices], device=self.device),
-            dones=torch.as_tensor(self.dones[indices], device=self.device),
+            dones=torch.as_tensor(dones, device=self.device),
         )
 
     def __len__(self) -> int:
@@ -161,6 +172,7 @@ class ReplayBuffer:
             "rewards": self.rewards,
             "next_observations": self.next_observations,
             "dones": self.dones,
+            "timeouts": self.timeouts,
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -171,6 +183,8 @@ class ReplayBuffer:
         self.rewards = state_dict["rewards"]
         self.next_observations = state_dict["next_observations"]
         self.dones = state_dict["dones"]
+        # Backward compatibility with replay buffers saved before timeout support.
+        self.timeouts = state_dict.get("timeouts", np.zeros_like(self.dones))
 
 
 class TensorboardLogger:
