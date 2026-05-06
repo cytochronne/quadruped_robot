@@ -470,30 +470,48 @@ def main():
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    runner_cfg = agent_cfg.to_dict()
-    if args_cli.use_ensemble:
-        runner_cfg.setdefault("policy", {})
-        runner_cfg["policy"]["ensemble_size"] = int(args_cli.encoder_size)
-    print("INFO: agent_cfg.device: ", agent_cfg.device)
-    runner = OnPolicyRunner(env, runner_cfg, log_dir=None, device=env.device)
-    runner.load(resume_path)
-    print(f"[CHECK] Checkpoint path: {resume_path}")
+    loaded_dict = torch.load(resume_path, weights_only=False)
+    is_off_policy = "actor" in loaded_dict and "model_state_dict" not in loaded_dict
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-
-    # export policy to onnx/jit
-    try:
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        policy_nn = runner.alg.actor_critic
-
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
+    if is_off_policy:
+        algo_name = loaded_dict.get("config", {}).get("algo", "unknown")
+        print(f"[INFO]: Detected off-policy checkpoint ({algo_name}), loading actor directly.")
+        obs_space = env.unwrapped.observation_space
+        act_space = env.unwrapped.action_space
+        obs_dim = obs_space["policy"].shape[0] if hasattr(obs_space, "__getitem__") else obs_space.shape[0]
+        action_dim = act_space.shape[0]
+        if "actor_target" in loaded_dict:
+            from rsl_rl_woUncertainty.algorithms.td3 import TD3Actor
+            actor = TD3Actor(obs_dim, action_dim, act_space.low, act_space.high).to(env.unwrapped.device)
+        else:
+            from rsl_rl_woUncertainty.algorithms.sac import SACActor
+            actor = SACActor(obs_dim, action_dim, act_space.low, act_space.high).to(env.unwrapped.device)
+        actor.load_state_dict(loaded_dict["actor"])
+        actor.eval()
+        policy = lambda obs: actor(obs, deterministic=True) if hasattr(actor, "action_log_prob") else actor(obs)
+        policy_nn = actor
         normalizer = None
+        runner = None
+    else:
+        runner_cfg = agent_cfg.to_dict()
+        if args_cli.use_ensemble:
+            runner_cfg.setdefault("policy", {})
+            runner_cfg["policy"]["ensemble_size"] = int(args_cli.encoder_size)
+        print("INFO: agent_cfg.device: ", agent_cfg.device)
+        runner = OnPolicyRunner(env, runner_cfg, log_dir=None, device=env.device)
+        runner.load(resume_path)
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        try:
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            policy_nn = runner.alg.actor_critic
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
+    print(f"[CHECK] Checkpoint path: {resume_path}")
 
     export_model_dir = os.path.join(log_dir, "exported")
     try:

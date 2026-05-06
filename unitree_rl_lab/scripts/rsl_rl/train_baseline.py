@@ -556,14 +556,9 @@ def _run_local_offpolicy_training(
             self.cur_reward_sum += reward
             self.cur_episode_length += 1
 
-            # Collect log info like PPO does
-            if "log" in info:
-                self.ep_infos.append(info["log"])
-
             # Process completed episodes
             done_ids = np.where(dones)[0]
             if len(done_ids) > 0:
-                # Update total episode counter
                 self._total_episodes_completed += len(done_ids)
 
                 for i in done_ids:
@@ -571,6 +566,17 @@ def _run_local_offpolicy_training(
                     self.lenbuffer.append(self.cur_episode_length[i])
                     self.cur_reward_sum[i] = 0
                     self.cur_episode_length[i] = 0
+
+                # Only collect log info for done envs, like PPO does
+                if "log" in info:
+                    ep_info = {}
+                    for key, val in info["log"].items():
+                        if isinstance(val, torch.Tensor):
+                            ep_info[key] = val[done_ids].cpu().float()
+                        elif isinstance(val, np.ndarray):
+                            ep_info[key] = val[done_ids].astype(np.float32)
+                    if ep_info:
+                        self.ep_infos.append(ep_info)
 
             return obs, reward, terminated, truncated, info
 

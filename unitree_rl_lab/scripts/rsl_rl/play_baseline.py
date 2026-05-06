@@ -117,35 +117,52 @@ def main():
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    if not hasattr(agent_cfg, "class_name") or agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        from rsl_rl.runners import DistillationRunner
+    loaded_dict = torch.load(resume_path, weights_only=False)
+    is_off_policy = "actor" in loaded_dict and "model_state_dict" not in loaded_dict
 
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    if is_off_policy:
+        # Off-policy checkpoint (SAC/TD3): reconstruct actor and load weights directly
+        algo_name = loaded_dict.get("config", {}).get("algo", "unknown")
+        print(f"[INFO]: Detected off-policy checkpoint ({algo_name}), loading actor directly.")
+        obs_space = env.unwrapped.observation_space
+        act_space = env.unwrapped.action_space
+        obs_dim = obs_space["policy"].shape[0] if hasattr(obs_space, "__getitem__") else obs_space.shape[0]
+        action_dim = act_space.shape[0]
+        action_low = act_space.low
+        action_high = act_space.high
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
-
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
+        if "actor_target" in loaded_dict:
+            from rsl_rl_woUncertainty.algorithms.td3 import TD3Actor
+            actor = TD3Actor(obs_dim, action_dim, action_low, action_high).to(env.unwrapped.device)
+        else:
+            from rsl_rl_woUncertainty.algorithms.sac import SACActor
+            actor = SACActor(obs_dim, action_dim, action_low, action_high).to(env.unwrapped.device)
+        actor.load_state_dict(loaded_dict["actor"])
+        actor.eval()
+        policy = lambda obs: actor(obs, deterministic=True) if hasattr(actor, "action_log_prob") else actor(obs)
+        policy_nn = actor
         normalizer = None
+        runner = None
+    else:
+        if not hasattr(agent_cfg, "class_name") or agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            from rsl_rl.runners import DistillationRunner
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(resume_path)
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        try:
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            policy_nn = runner.alg.actor_critic
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
 
     # Initialize Waypoint Manager if enabled
     waypoint_manager = None
