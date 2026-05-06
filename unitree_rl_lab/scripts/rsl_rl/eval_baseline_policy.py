@@ -494,14 +494,20 @@ def main():
         actor.load_state_dict(actor_state)
         actor.eval()
 
-        def _flatten_obs(obs):
-            if isinstance(obs, dict):
-                parts = [obs[k].reshape(obs[k].shape[0], -1) for k in sorted(obs.keys())]
+        def _flatten_obs(obs, extras=None):
+            obs_dict = extras.get("observations") if extras else None
+            if obs_dict is None:
+                obs_dict = obs if isinstance(obs, dict) else None
+            if obs_dict is not None:
+                parts = [obs_dict[k].reshape(obs_dict[k].shape[0], -1) for k in sorted(obs_dict.keys())]
                 return torch.cat(parts, dim=-1)
             return obs
 
         _actor = actor
-        policy = lambda obs: _actor(_flatten_obs(obs), deterministic=True) if hasattr(_actor, "action_log_prob") else _actor(_flatten_obs(obs))
+        if hasattr(_actor, "action_log_prob"):
+            policy = lambda obs, extras=None: _actor(_flatten_obs(obs, extras), deterministic=True)
+        else:
+            policy = lambda obs, extras=None: _actor(_flatten_obs(obs, extras))
         policy_nn = actor
         normalizer = None
         runner = None
@@ -725,7 +731,7 @@ def main():
 
         # run in inference mode
         with torch.inference_mode():
-            actions = policy(obs)
+            actions = policy(obs, extras) if is_off_policy else policy(obs)
             ret = env.step(actions)
             
             # Correctly unpack env.step() return values (5-tuple in newer gym)
