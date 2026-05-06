@@ -493,7 +493,15 @@ def main():
 
         actor.load_state_dict(actor_state)
         actor.eval()
-        policy = lambda obs: actor(obs, deterministic=True) if hasattr(actor, "action_log_prob") else actor(obs)
+
+        def _flatten_obs(obs):
+            if isinstance(obs, dict):
+                parts = [obs[k].reshape(obs[k].shape[0], -1) for k in sorted(obs.keys())]
+                return torch.cat(parts, dim=-1)
+            return obs
+
+        _actor = actor
+        policy = lambda obs: _actor(_flatten_obs(obs), deterministic=True) if hasattr(_actor, "action_log_prob") else _actor(_flatten_obs(obs))
         policy_nn = actor
         normalizer = None
         runner = None
