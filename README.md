@@ -18,12 +18,12 @@
    - Complete all dependency installations as described in the IsaacLab docs.
 3. Set up unitree_rl_lab:
    - Enter the unitree_rl_lab directory and follow its README to install dependencies and configure the environment.
-4. Install rsl_rl in editable (development) mode:
+4. Install rl_base in editable (development) mode:
    ```sh
    cd IsaacLab
-   ./isaaclab.sh -p -m pip install -e /path/to/rsl_rl
+   ./isaaclab.sh -p -m pip install -e /path/to/rl_base
    ```
-   - Replace `/path/to/rsl_rl` with the actual path to your rsl_rl source directory.
+   - Replace `/path/to/rl_base` with the actual path to your rl_base source directory.
 
 ## Additional Notes
 - Using a dedicated conda environment is strongly recommended to avoid dependency conflicts.
@@ -31,7 +31,7 @@
 
 ## RL / BC Switch Instructions
 
-To switch between PPO training and BC training, modify `TerrainAwareDistillationAlgorithmCfg` in `/home/cytochrome/pan1/quadruped_robot/unitree_rl_lab/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/agents/rsl_rl_woU_baseline_cfg.py`.
+To switch between PPO training and BC training, modify `TerrainAwareDistillationAlgorithmCfg` in `/home/cytochrome/pan1/quadruped_robot/unitree_rl_lab/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/agents/rl_base_woU_baseline_cfg.py`.
 
 If you want to run PPO, make sure the `#RL settings` section is:
 

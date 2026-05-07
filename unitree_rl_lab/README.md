@@ -75,14 +75,14 @@ Currently supports Unitree **Go2**, **H1** and **G1-29dof** robots.
     ```bash
     ./unitree_rl_lab.sh -t --task Unitree-G1-29dof-Velocity # support for autocomplete task-name
     # same as
-    python scripts/rsl_rl/train.py --headless --task Unitree-G1-29dof-Velocity
+    python scripts/rl_base/train_teacher.py --headless --task Unitree-G1-29dof-Velocity
     ```
   - Inference with a trained agent:
 
     ```bash
     ./unitree_rl_lab.sh -p --task Unitree-G1-29dof-Velocity # support for autocomplete task-name
     # same as
-    python scripts/rsl_rl/play.py --task Unitree-G1-29dof-Velocity
+    python scripts/rl_base/play_teacher.py --task Unitree-G1-29dof-Velocity
     ```
 
 ## Deploy

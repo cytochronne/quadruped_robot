@@ -7,7 +7,7 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.velocity_env_cfg:UnitreeGo2RoughEnvCfg",
         "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg:UnitreeGo2RoughEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rsl_rl_woU_baseline_cfg:TerrainAwareDistillationRunnerCfg",
+        "rl_base_cfg_entry_point": f"unitree_rl_lab.tasks.locomotion.agents.rl_base_woU_baseline_cfg:TerrainAwareDistillationRunnerCfg",
     },
 )
 

@@ -372,9 +372,9 @@ class RobotEnvCfg(ManagerBasedRLEnvCfg):
 
     # Ensemble settings
     encoder_paths: list[str] = [
-        "/home/cft/zikang/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rsl_rl_MLE/init/model_16500MLE.pt",
-        "/home/cft/zikang/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rsl_rl_MLE/init/model_16500MLE.pt",
-        "/home/cft/zikang/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rsl_rl_MLE/init/model_16500MLE.pt",
+        "/home/cft/zikang/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rl_base_mle/init/model_16500MLE.pt",
+        "/home/cft/zikang/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rl_base_mle/init/model_16500MLE.pt",
+        "/home/cft/zikang/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rl_base_mle/init/model_16500MLE.pt",
     ]
 
     def __post_init__(self):

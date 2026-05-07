@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: rl-base-lib
+Version: 2.3.3
+Summary: Fast and simple RL algorithms implemented in PyTorch
+License: BSD-3-Clause
+Keywords: reinforcement-learning,isaac,rl-pytorch,unitree
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=1.10.0
+Requires-Dist: torchvision>=0.5.0
+Requires-Dist: numpy>=1.16.4
+Requires-Dist: GitPython
+Requires-Dist: onnx
+
+# rl_base
+
+Local reinforcement learning library used by this repository.

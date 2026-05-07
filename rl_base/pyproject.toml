@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-base-lib"
+version = "2.3.3"
+keywords = ["reinforcement-learning", "isaac", "rl-pytorch", "unitree"]
+description = "Fast and simple RL algorithms implemented in PyTorch"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=1.10.0",
+    "torchvision>=0.5.0",
+    "numpy>=1.16.4",
+    "GitPython",
+    "onnx",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rl_base*"]
+
+[tool.setuptools.package-data]
+"rl_base" = ["config/*", "licenses/*"]
+
+[tool.isort]
+py_version = 37
+line_length = 120
+group_by_package = true
+skip_glob = [".vscode/*"]
+sections = [
+    "FUTURE",
+    "STDLIB",
+    "THIRDPARTY",
+    "FIRSTPARTY",
+    "LOCALFOLDER",
+]
+extra_standard_library = [
+    "numpy",
+    "torch",
+    "tensordict",
+    "warp",
+    "typing_extensions",
+    "git",
+]
+known_first_party = "rl_base"
+
+[tool.pyright]
+include = ["rl_base"]
+typeCheckingMode = "basic"
+pythonVersion = "3.7"
+pythonPlatform = "Linux"
+enableTypeIgnoreComments = true
+reportMissingImports = "none"
+reportMissingModuleSource = "none"
+reportGeneralTypeIssues = "none"
+reportOptionalMemberAccess = "warning"
+reportPrivateUsage = "warning"

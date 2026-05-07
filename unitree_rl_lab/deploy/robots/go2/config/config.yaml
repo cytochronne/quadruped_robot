@@ -34,5 +34,5 @@ FSM:
       Passive: LT + B.on_pressed
     keyboard_transitions:
       Passive: p.on_pressed
-    policy_dir: /home/cytochrome/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rsl_rl/student_policy/2026-03-23_20-35-39_Student-Baseline-RL-terrain_newReward14model_9700
+    policy_dir: /home/cytochrome/State-Estimation-AMP-Lab/unitree_rl_lab/logs/rl_base/student_policy/2026-03-23_20-35-39_Student-Baseline-RL-terrain_newReward14model_9700
     
